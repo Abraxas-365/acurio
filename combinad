@@ -1,0 +1,199 @@
+package otp
+
+import (
+	"crypto/rand"
+	"fmt"
+	"time"
+)
+
+type OTPPurpose string
+
+const (
+	OTPPurposeJobApplication OTPPurpose = "JOB_APPLICATION"
+	OTPPurposeVerification   OTPPurpose = "VERIFICATION"
+)
+
+type OTP struct {
+	ID         string
+	Contact    string // Email or phone
+	Code       string
+	Purpose    OTPPurpose
+	ExpiresAt  time.Time
+	VerifiedAt *time.Time
+	Attempts   int
+	CreatedAt  time.Time
+}
+
+func (o *OTP) IsValid() bool {
+	return time.Now().Before(o.ExpiresAt) && o.VerifiedAt == nil && o.Attempts < 5
+}
+
+func (o *OTP) IsExpired() bool {
+	return time.Now().After(o.ExpiresAt)
+}
+
+func (o *OTP) Verify() error {
+	if o.IsExpired() {
+		return ErrOTPExpired()
+	}
+	if o.Attempts >= 5 {
+		return ErrTooManyAttempts()
+	}
+	now := time.Now()
+	o.VerifiedAt = &now
+	return nil
+}
+
+func (o *OTP) IncrementAttempts() {
+	o.Attempts++
+}
+
+func GenerateOTPCode() (string, error) {
+	bytes := make([]byte, 3)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	code := fmt.Sprintf("%06d", int(bytes[0])<<16|int(bytes[1])<<8|int(bytes[2]))
+	return code[:6], nil
+}
+package otpsrv
+
+import (
+	"context"
+	"time"
+
+	"github.com/Abraxas-365/relay/pkg/errx"
+	"github.com/Abraxas-365/relay/pkg/iam/otp"
+	"github.com/google/uuid"
+)
+
+// NotificationService is a generic interface for sending OTP codes
+type NotificationService interface {
+	SendOTP(ctx context.Context, contact string, code string) error
+}
+
+type OTPService struct {
+	repo                otp.Repository
+	notificationService NotificationService
+}
+
+func NewOTPService(repo otp.Repository, notificationService NotificationService) *OTPService {
+	return &OTPService{
+		repo:                repo,
+		notificationService: notificationService,
+	}
+}
+
+// GenerateOTP creates and sends an OTP
+func (s *OTPService) GenerateOTP(ctx context.Context, contact string, purpose otp.OTPPurpose) (*otp.OTP, error) {
+	// Rate limiting check
+	existing, _ := s.repo.GetLatestByContact(ctx, contact, purpose)
+	if existing != nil && existing.IsValid() {
+		timeSinceCreation := time.Since(existing.CreatedAt)
+		if timeSinceCreation < 1*time.Minute {
+			return nil, otp.ErrTooManyRequests().WithDetail("retry_after", "60 seconds")
+		}
+	}
+
+	// Generate code
+	code, err := otp.GenerateOTPCode()
+	if err != nil {
+		return nil, errx.Wrap(err, "failed to generate OTP code", errx.TypeInternal)
+	}
+
+	// Create OTP
+	newOTP := &otp.OTP{
+		ID:        uuid.NewString(),
+		Contact:   contact,
+		Code:      code,
+		Purpose:   purpose,
+		ExpiresAt: time.Now().Add(10 * time.Minute),
+		Attempts:  0,
+		CreatedAt: time.Now(),
+	}
+
+	// Save OTP
+	if err := s.repo.Create(ctx, newOTP); err != nil {
+		return nil, errx.Wrap(err, "failed to save OTP", errx.TypeInternal)
+	}
+
+	// Send notification
+	if err := s.notificationService.SendOTP(ctx, contact, code); err != nil {
+		return nil, errx.Wrap(err, "failed to send OTP", errx.TypeExternal)
+	}
+
+	return newOTP, nil
+}
+
+// VerifyOTP validates an OTP code
+func (s *OTPService) VerifyOTP(ctx context.Context, contact string, code string) (*otp.OTP, error) {
+	otpEntity, err := s.repo.GetByContactAndCode(ctx, contact, code)
+	if err != nil {
+		return nil, otp.ErrInvalidOTP()
+	}
+
+	if otpEntity.IsExpired() {
+		return nil, otp.ErrOTPExpired()
+	}
+
+	if otpEntity.Attempts >= 5 {
+		return nil, otp.ErrTooManyAttempts()
+	}
+
+	if otpEntity.VerifiedAt != nil {
+		return nil, otp.ErrOTPAlreadyUsed()
+	}
+
+	otpEntity.IncrementAttempts()
+
+	if otpEntity.Code == code {
+		if err := otpEntity.Verify(); err != nil {
+			return nil, err
+		}
+
+		if err := s.repo.Update(ctx, otpEntity); err != nil {
+			return nil, errx.Wrap(err, "failed to update OTP", errx.TypeInternal)
+		}
+
+		return otpEntity, nil
+	}
+
+	if err := s.repo.Update(ctx, otpEntity); err != nil {
+		return nil, errx.Wrap(err, "failed to update OTP attempts", errx.TypeInternal)
+	}
+
+	return nil, otp.ErrInvalidOTP().WithDetail("attempts_remaining", 5-otpEntity.Attempts)
+}
+package otp
+
+import "context"
+
+type Repository interface {
+	Create(ctx context.Context, otp *OTP) error
+	GetByContactAndCode(ctx context.Context, contact string, code string) (*OTP, error)
+	GetLatestByContact(ctx context.Context, contact string, purpose OTPPurpose) (*OTP, error)
+	Update(ctx context.Context, otp *OTP) error
+	DeleteExpired(ctx context.Context) error
+}
+package otp
+
+import (
+	"github.com/Abraxas-365/relay/pkg/errx"
+	"net/http"
+)
+
+var ErrRegistry = errx.NewRegistry("OTP")
+
+var (
+	CodeInvalidOTP      = ErrRegistry.Register("INVALID_OTP", errx.TypeValidation, http.StatusBadRequest, "Invalid or incorrect OTP code")
+	CodeOTPExpired      = ErrRegistry.Register("OTP_EXPIRED", errx.TypeValidation, http.StatusBadRequest, "OTP code has expired")
+	CodeOTPAlreadyUsed  = ErrRegistry.Register("OTP_ALREADY_USED", errx.TypeBusiness, http.StatusBadRequest, "OTP code has already been used")
+	CodeTooManyAttempts = ErrRegistry.Register("TOO_MANY_ATTEMPTS", errx.TypeBusiness, http.StatusTooManyRequests, "Too many verification attempts")
+	CodeTooManyRequests = ErrRegistry.Register("TOO_MANY_REQUESTS", errx.TypeBusiness, http.StatusTooManyRequests, "Too many OTP requests")
+)
+
+func ErrInvalidOTP() *errx.Error      { return ErrRegistry.New(CodeInvalidOTP) }
+func ErrOTPExpired() *errx.Error      { return ErrRegistry.New(CodeOTPExpired) }
+func ErrOTPAlreadyUsed() *errx.Error  { return ErrRegistry.New(CodeOTPAlreadyUsed) }
+func ErrTooManyAttempts() *errx.Error { return ErrRegistry.New(CodeTooManyAttempts) }
+func ErrTooManyRequests() *errx.Error { return ErrRegistry.New(CodeTooManyRequests) }
