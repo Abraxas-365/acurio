@@ -26,11 +26,16 @@ func NewEmbeddingsGenerator(apiKey string) *EmbeddingsGenerator {
 
 // GenerateEmbedding creates an embedding vector for text
 func (g *EmbeddingsGenerator) GenerateEmbedding(ctx context.Context, text string) ([]float32, error) {
+	if text == "" {
+		return nil, fmt.Errorf("text cannot be empty")
+	}
+
+	// Send as array with single element (works consistently)
 	resp, err := g.client.Embeddings.New(ctx, openai.EmbeddingNewParams{
 		Input: openai.EmbeddingNewParamsInputUnion{
 			OfArrayOfStrings: []string{text},
 		},
-		Model: "text-embedding-3-small", // Cost-effective and performant
+		Model: openai.EmbeddingModelTextEmbedding3Small,
 	})
 
 	if err != nil {
@@ -57,15 +62,31 @@ func (g *EmbeddingsGenerator) GenerateBatchEmbeddings(ctx context.Context, texts
 		return nil, fmt.Errorf("no texts provided")
 	}
 
+	// Filter out empty strings
+	validTexts := make([]string, 0, len(texts))
+	for _, text := range texts {
+		if text != "" {
+			validTexts = append(validTexts, text)
+		}
+	}
+
+	if len(validTexts) == 0 {
+		return nil, fmt.Errorf("all texts are empty")
+	}
+
 	resp, err := g.client.Embeddings.New(ctx, openai.EmbeddingNewParams{
 		Input: openai.EmbeddingNewParamsInputUnion{
-			OfArrayOfStrings: texts,
+			OfArrayOfStrings: validTexts,
 		},
-		Model: "text-embedding-3-small",
+		Model: openai.EmbeddingModelTextEmbedding3Small,
 	})
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate embeddings: %w", err)
+	}
+
+	if len(resp.Data) == 0 {
+		return nil, fmt.Errorf("no embedding data returned")
 	}
 
 	embeddings := make([][]float32, len(resp.Data))

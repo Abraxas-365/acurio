@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/Abraxas-365/relay/pkg/iam/auth"
-	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 // RedisStateManager implementación en Redis del StateManager

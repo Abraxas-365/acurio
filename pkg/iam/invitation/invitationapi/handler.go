@@ -21,7 +21,7 @@ func NewInvitationHandlers(service *invitationsrv.InvitationService) *Invitation
 }
 
 // RegisterRoutes registra las rutas de invitaciones en Fiber
-func (h *InvitationHandlers) RegisterRoutes(app *fiber.App, authMiddleware *auth.TokenMiddleware) {
+func (h *InvitationHandlers) RegisterRoutes(app *fiber.App, authMiddleware *auth.UnifiedAuthMiddleware) {
 	invitations := app.Group("/invitations", authMiddleware.Authenticate())
 
 	// Rutas protegidas (requieren autenticación)

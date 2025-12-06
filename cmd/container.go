@@ -6,7 +6,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/Abraxas-365/relay/internal/ai/embeddings"
+	"github.com/Abraxas-365/relay/internal/ai/resumeparser"
 	"github.com/Abraxas-365/relay/pkg/fsx"
+	"github.com/Abraxas-365/relay/pkg/fsx/fsxlocal"
 	"github.com/Abraxas-365/relay/pkg/fsx/fsxs3"
 	"github.com/Abraxas-365/relay/pkg/iam"
 	"github.com/Abraxas-365/relay/pkg/iam/apikey/apikeyapi"
@@ -26,21 +29,15 @@ import (
 	"github.com/Abraxas-365/relay/pkg/iam/user/userinfra"
 	"github.com/Abraxas-365/relay/pkg/iam/user/usersrv"
 	"github.com/Abraxas-365/relay/pkg/logx"
-	"github.com/Abraxas-365/relay/recruitment/application/applicationapi"
-	"github.com/Abraxas-365/relay/recruitment/application/applicationinfra"
-	"github.com/Abraxas-365/relay/recruitment/application/applicationsrv"
-	"github.com/Abraxas-365/relay/recruitment/candidate/candidateapi"
-	"github.com/Abraxas-365/relay/recruitment/candidate/candidateauth"
-	"github.com/Abraxas-365/relay/recruitment/candidate/candidateinfra"
-	"github.com/Abraxas-365/relay/recruitment/candidate/candidatesrv"
-	"github.com/Abraxas-365/relay/recruitment/job/jobapi"
-	"github.com/Abraxas-365/relay/recruitment/job/jobinfra"
-	"github.com/Abraxas-365/relay/recruitment/job/jobsrv"
+	"github.com/Abraxas-365/relay/recruitment/resume/resumeapi"
+	"github.com/Abraxas-365/relay/recruitment/resume/resumeinfra"
+	"github.com/Abraxas-365/relay/recruitment/resume/resumesrv"
+	"github.com/Abraxas-365/relay/recruitment/resume/worker"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/go-redis/redis/v8"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
 // Container holds all application dependencies
@@ -54,6 +51,10 @@ type Container struct {
 	FileSystem fsx.FileSystem
 	S3Client   *s3.Client
 
+	// AI Services
+	ResumeParser *resumeparser.ResumeParser
+	EmbedGen     *embeddings.EmbeddingsGenerator
+
 	// Core IAM Services
 	AuthService       *auth.AuthHandlers
 	TokenService      auth.TokenService
@@ -65,39 +66,46 @@ type Container struct {
 	OTPService        *otpsrv.OTPService
 
 	// Recruitment Services
-	JobService           *jobsrv.JobService
-	CandidateService     *candidatesrv.CandidateService
-	CandidateAuthService *candidateauth.CandidateAuthService
-	ApplicationService   *applicationsrv.ApplicationService
+	ResumeService *resumesrv.Service
+	ResumeWorker  *worker.ResumeWorker
 
 	// API Handlers
-	APIKeyHandlers        *apikeyapi.APIKeyHandlers
-	InvitationHandlers    *invitationapi.InvitationHandlers
-	JobHandlers           *jobapi.Handlers
-	CandidateHandlers     *candidateapi.Handlers
-	CandidateAuthHandlers *candidateauth.Handlers
-	ApplicationHandlers   *applicationapi.Handlers
+	APIKeyHandlers     *apikeyapi.APIKeyHandlers
+	InvitationHandlers *invitationapi.InvitationHandlers
+	ResumeHandlers     *resumeapi.ResumeHandlers
 
 	// Middleware
 	UnifiedAuthMiddleware *auth.UnifiedAuthMiddleware
 	AuthMiddleware        *auth.TokenMiddleware
+
+	// Worker control
+	workerCtx    context.Context
+	workerCancel context.CancelFunc
 }
 
 // NewContainer initializes the dependency injection container
 func NewContainer() *Container {
+	logx.Info("🔧 Initializing dependency container...")
+
 	c := &Container{}
 	c.initInfrastructure()
+	c.initAIServices()
 	c.initRepositories()
+	c.initWorkers()
+
+	logx.Info("✅ Container initialized successfully")
 	return c
 }
 
 func (c *Container) initInfrastructure() {
+	logx.Info("🏗️ Initializing infrastructure...")
+
 	// 1. Database Connection
-	dbHost := os.Getenv("DB_HOST")
-	dbPort := os.Getenv("DB_PORT")
-	dbUser := os.Getenv("DB_USER")
-	dbPass := os.Getenv("DB_PASS")
-	dbName := os.Getenv("DB_NAME")
+	dbHost := getEnv("DB_HOST", "localhost")
+	dbPort := getEnv("DB_PORT", "5432")
+	dbUser := getEnv("DB_USER", "postgres")
+	dbPass := getEnv("DB_PASS", "postgres")
+	dbName := getEnv("DB_NAME", "relay")
 	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		dbHost, dbPort, dbUser, dbPass, dbName)
 
@@ -109,44 +117,83 @@ func (c *Container) initInfrastructure() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	c.DB = db
+	logx.Info("✅ Database connected")
 
 	// 2. Redis Connection
-	redisAddr := os.Getenv("REDIS_ADDR")
-	redisPass := os.Getenv("REDIS_PASS")
+	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
+	redisPass := getEnv("REDIS_PASS", "")
+	redisDB := getEnvInt("REDIS_DB", 0)
 	c.Redis = redis.NewClient(&redis.Options{
 		Addr:     redisAddr,
 		Password: redisPass,
-		DB:       0,
+		DB:       redisDB,
 	})
 	if _, err := c.Redis.Ping(context.Background()).Result(); err != nil {
-		logx.Warnf("Failed to connect to Redis: %v", err)
+		logx.Fatalf("Failed to connect to Redis: %v (Redis is required for job queue)", err)
+	} else {
+		logx.Info("✅ Redis connected")
 	}
 
-	// 3. AWS S3 Configuration
-	awsRegion := os.Getenv("AWS_REGION")
-	awsBucket := os.Getenv("AWS_BUCKET")
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsRegion))
-	if err != nil {
-		logx.Fatalf("unable to load SDK config, %v", err)
+	// 3. File Storage Configuration (Local or S3)
+	storageMode := getEnv("STORAGE_MODE", "local") // "local" or "s3"
+
+	switch storageMode {
+	case "s3":
+		// AWS S3 Configuration
+		awsRegion := getEnv("AWS_REGION", "us-east-1")
+		awsBucket := getEnv("AWS_BUCKET", "relay-uploads")
+		cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsRegion))
+		if err != nil {
+			logx.Fatalf("Unable to load AWS SDK config: %v", err)
+		}
+		c.S3Client = s3.NewFromConfig(cfg)
+		c.FileSystem = fsxs3.NewS3FileSystem(c.S3Client, awsBucket, "")
+		logx.Infof("✅ S3 file system configured (bucket: %s, region: %s)", awsBucket, awsRegion)
+
+	case "local":
+		// Local File System
+		uploadDir := getEnv("UPLOAD_DIR", "./uploads")
+		localFS, err := fsxlocal.NewLocalFileSystem(uploadDir)
+		if err != nil {
+			logx.Fatalf("Failed to initialize local file system: %v", err)
+		}
+		c.FileSystem = localFS
+		logx.Infof("✅ Local file system configured (path: %s)", localFS.GetBasePath())
+
+	default:
+		logx.Fatalf("Unknown STORAGE_MODE: %s (use 'local' or 's3')", storageMode)
 	}
-	c.S3Client = s3.NewFromConfig(cfg)
-	c.FileSystem = fsxs3.NewS3FileSystem(c.S3Client, awsBucket, "uploads")
 
 	// 4. Auth Config
 	c.AuthConfig = auth.DefaultConfig()
-	c.AuthConfig.JWT.SecretKey = os.Getenv("JWT_SECRET")
+	c.AuthConfig.JWT.SecretKey = getEnv("JWT_SECRET", "")
 	if c.AuthConfig.JWT.SecretKey == "" {
-		logx.Warn("JWT_SECRET is not set, using default (unsafe for production)")
+		logx.Warn("⚠️  JWT_SECRET is not set, using default (UNSAFE for production)")
 		c.AuthConfig.JWT.SecretKey = "super-secret-key-please-change-me-in-production"
 	}
 
 	// OAuth Configs
-	c.AuthConfig.OAuth.Google.ClientID = os.Getenv("GOOGLE_CLIENT_ID")
-	c.AuthConfig.OAuth.Google.ClientSecret = os.Getenv("GOOGLE_CLIENT_SECRET")
-	c.AuthConfig.OAuth.Google.RedirectURL = os.Getenv("GOOGLE_REDIRECT_URL")
+	c.AuthConfig.OAuth.Google.ClientID = getEnv("GOOGLE_CLIENT_ID", "")
+	c.AuthConfig.OAuth.Google.ClientSecret = getEnv("GOOGLE_CLIENT_SECRET", "")
+	c.AuthConfig.OAuth.Google.RedirectURL = getEnv("GOOGLE_REDIRECT_URL", "")
+}
+
+func (c *Container) initAIServices() {
+	logx.Info("🤖 Initializing AI services...")
+
+	openAIKey := getEnv("OPENAI_API_KEY", "")
+	if openAIKey == "" {
+		logx.Warn("⚠️  OPENAI_API_KEY not set - Resume parsing will be disabled")
+	} else {
+		c.ResumeParser = resumeparser.NewResumeParser(openAIKey)
+		c.EmbedGen = embeddings.NewEmbeddingsGenerator(openAIKey)
+		logx.Info("✅ AI services initialized (GPT-4o + Embeddings)")
+	}
 }
 
 func (c *Container) initRepositories() {
+	logx.Info("🗄️  Initializing repositories and services...")
+
 	// --- IAM Repositories ---
 	tenantRepo := tenantinfra.NewPostgresTenantRepository(c.DB)
 	tenantConfigRepo := tenantinfra.NewPostgresTenantConfigRepository(c.DB)
@@ -158,16 +205,15 @@ func (c *Container) initRepositories() {
 	sessionRepo := authinfra.NewPostgresSessionRepository(c.DB)
 	invitationRepo := invitationinfra.NewPostgresInvitationRepository(c.DB)
 	apiKeyRepo := apikeyinfra.NewPostgresAPIKeyRepository(c.DB)
+	otpRepo := otpinfra.NewPostgresOTPRepository(c.DB)
 
 	// --- Recruitment Repositories ---
-	jobRepo := jobinfra.NewPostgresJobRepository(c.DB)
-	candidateRepo := candidateinfra.NewPostgresCandidateRepository(c.DB)
-	applicationRepo := applicationinfra.NewPostgresApplicationRepository(c.DB)
+	resumeRepo := resumeinfra.NewPostgresResumeRepository(c.DB)
+	jobRepo := resumeinfra.NewPostgresJobRepository(c.DB)
 
-	// NOTE: Using a simple mock OTP repo or implementing one in Postgres would be needed here.
-	// Assuming a Postgres implementation exists similar to others:
-	// otpRepo := otpinfra.NewPostgresOTPRepository(c.DB)
-	// For now, we assume it's handled within the OTP Service logic or passed as nil if not ready
+	// --- Queue Infrastructure ---
+	queueName := getEnv("RESUME_QUEUE_NAME", "resume:processing")
+	resumeQueue := resumeinfra.NewRedisQueue(c.Redis, queueName)
 
 	// --- Infrastructure Services ---
 	stateManager := authinfra.NewRedisStateManager(c.Redis)
@@ -181,14 +227,13 @@ func (c *Container) initRepositories() {
 		c.AuthConfig.JWT.Issuer,
 	)
 
-	// --- Domain Services ---
-
-	// 1. IAM Domain Services
+	// --- IAM Domain Services ---
 	c.TenantService = tenantsrv.NewTenantService(tenantRepo, tenantConfigRepo, userRepo)
 	c.UserService = usersrv.NewUserService(userRepo, userRoleRepo, tenantRepo, roleRepo, passwordSvc)
 	c.RoleService = rolesrv.NewRoleService(roleRepo, rolePermRepo, tenantRepo)
 	c.InvitationService = invitationsrv.NewInvitationService(invitationRepo, userRepo, tenantRepo, roleRepo)
 	c.APIKeyService = apikeysrv.NewAPIKeyService(apiKeyRepo, tenantRepo, userRepo)
+	c.OTPService = otpsrv.NewOTPService(otpRepo, NewConsoleNotifier())
 
 	// OAuth Services Map
 	oauthServices := map[iam.OAuthProvider]auth.OAuthService{
@@ -208,43 +253,119 @@ func (c *Container) initRepositories() {
 		invitationRepo,
 	)
 
-	// 2. Recruitment Domain Services
-	c.JobService = jobsrv.NewJobService(jobRepo, userRepo)
-	c.CandidateService = candidatesrv.NewCandidateService(candidateRepo, userRepo)
-
-	// Specialized Auth for Candidates
-	candidateTokenSvc := candidateauth.NewCandidateTokenService(c.TokenService)
-
-	// OTP Service (Needs a Notification Service impl, stubbing for now)
-
-	otpRepo := otpinfra.NewPostgresOTPRepository(c.DB)
-	c.OTPService = otpsrv.NewOTPService(otpRepo, NewConsoleNotifier())
-
-	// Note: Since OTP dependencies weren't fully provided in the prompt,
-	// we initialize CandidateAuthService with nil OTP service or require further implementation.
-	// Assuming the services are correctly instantiated:
-	c.CandidateAuthService = candidateauth.NewCandidateAuthService(candidateRepo, c.OTPService, candidateTokenSvc)
-
-	c.ApplicationService = applicationsrv.NewApplicationService(
-		applicationRepo,
-		candidateRepo,
+	// --- Recruitment Services ---
+	c.ResumeService = resumesrv.NewService(
+		resumeRepo,
+		c.ResumeParser,
+		c.EmbedGen,
 		jobRepo,
-		userRepo,
 		c.FileSystem,
+		resumeQueue,
 	)
 
-	// --- Handlers ---
+	// --- API Handlers ---
 	c.APIKeyHandlers = apikeyapi.NewAPIKeyHandlers(c.APIKeyService)
 	c.InvitationHandlers = invitationapi.NewInvitationHandlers(c.InvitationService)
-	c.JobHandlers = jobapi.NewHandlers(c.JobService)
-	c.CandidateHandlers = candidateapi.NewHandlers(c.CandidateService)
-	c.CandidateAuthHandlers = candidateauth.NewHandlers(c.CandidateAuthService, c.ApplicationService)
-	c.ApplicationHandlers = applicationapi.NewHandlers(c.ApplicationService)
+	c.ResumeHandlers = resumeapi.NewResumeHandlers(c.ResumeService, c.FileSystem)
 
 	// --- Middleware ---
 	c.AuthMiddleware = auth.NewAuthMiddleware(c.TokenService)
 	c.UnifiedAuthMiddleware = auth.NewAPIKeyMiddleware(c.APIKeyService, c.TokenService)
+
+	logx.Info("✅ All services and handlers initialized")
 }
+
+func (c *Container) initWorkers() {
+	logx.Info("👷 Initializing background workers...")
+
+	// Create worker context
+	c.workerCtx, c.workerCancel = context.WithCancel(context.Background())
+
+	// Get worker configuration
+	workerCount := getEnvInt("RESUME_WORKER_COUNT", 3)
+	queueName := getEnv("RESUME_QUEUE_NAME", "resume:processing")
+
+	// Create queue for workers
+	resumeQueue := resumeinfra.NewRedisQueue(c.Redis, queueName)
+
+	// Initialize resume worker
+	c.ResumeWorker = worker.NewResumeWorker(
+		c.ResumeService,
+		resumeQueue,
+		workerCount,
+	)
+
+	// Start workers
+	c.ResumeWorker.Start(c.workerCtx)
+
+	logx.Infof("✅ Started %d resume processing workers", workerCount)
+}
+
+// Cleanup closes all connections and stops workers
+func (c *Container) Cleanup() {
+	logx.Info("🧹 Cleaning up resources...")
+
+	// Stop workers first
+	if c.workerCancel != nil {
+		logx.Info("Stopping background workers...")
+		c.workerCancel()
+		// Give workers time to finish current jobs
+		time.Sleep(2 * time.Second)
+		logx.Info("✅ Workers stopped")
+	}
+
+	// Close database connection
+	if c.DB != nil {
+		if err := c.DB.Close(); err != nil {
+			logx.Errorf("Error closing database: %v", err)
+		} else {
+			logx.Info("✅ Database connection closed")
+		}
+	}
+
+	// Close Redis connection
+	if c.Redis != nil {
+		if err := c.Redis.Close(); err != nil {
+			logx.Errorf("Error closing Redis: %v", err)
+		} else {
+			logx.Info("✅ Redis connection closed")
+		}
+	}
+
+	logx.Info("✅ Cleanup completed")
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// getEnv gets an environment variable with a default value
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
+
+// getEnvInt gets an environment variable as int with a default value
+func getEnvInt(key string, defaultValue int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+
+	var intValue int
+	if _, err := fmt.Sscanf(value, "%d", &intValue); err != nil {
+		logx.Warnf("Invalid integer value for %s: %s, using default: %d", key, value, defaultValue)
+		return defaultValue
+	}
+	return intValue
+}
+
+// ============================================================================
+// Console Notifier for OTP (Development)
+// ============================================================================
 
 // ConsoleNotifier implements the NotificationService interface
 // by printing OTP codes to the terminal/console
@@ -257,15 +378,20 @@ func NewConsoleNotifier() *ConsoleNotifier {
 
 // SendOTP prints the OTP code to the terminal
 func (n *ConsoleNotifier) SendOTP(ctx context.Context, contact string, code string) error {
-	fmt.Println("=", 50)
+	fmt.Println("=" + repeatString("=", 50))
 	fmt.Printf("📧 OTP NOTIFICATION\n")
 	fmt.Printf("Contact: %s\n", contact)
 	fmt.Printf("Code: %s\n", code)
-	fmt.Println("=", 50)
+	fmt.Println("=" + repeatString("=", 50))
 
-	logx.Info(
-		fmt.Sprintf("OTP sent to %s: %s", contact, code),
-	)
-
+	logx.Info(fmt.Sprintf("OTP sent to %s: %s", contact, code))
 	return nil
+}
+
+func repeatString(s string, count int) string {
+	result := ""
+	for i := 0; i < count; i++ {
+		result += s
+	}
+	return result
 }

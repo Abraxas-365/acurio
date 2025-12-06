@@ -45,6 +45,15 @@ const (
 	ScopeOffersDelete  = "offers:delete"
 	ScopeOffersApprove = "offers:approve"
 	ScopeOffersSend    = "offers:send"
+
+	ScopeResumesAll     = "resumes:*"
+	ScopeResumesRead    = "resumes:read"    // View resumes
+	ScopeResumesWrite   = "resumes:write"   // Create/edit resumes
+	ScopeResumesDelete  = "resumes:delete"  // Delete resumes
+	ScopeResumesPublish = "resumes:publish" // Publish/activate resumes
+	ScopeResumesOwn     = "resumes:own"     // Manage only own resumes (for candidates)
+	ScopeResumesSearch  = "resumes:search"  // Search/semantic search resumes
+	ScopeResumesExport  = "resumes:export"  // Export resume data
 )
 
 // DomainScopeCategories organizes domain-specific scopes
@@ -90,6 +99,16 @@ var DomainScopeCategories = map[string][]string{
 		ScopeOffersApprove,
 		ScopeOffersSend,
 	},
+	"Resumes": {
+		ScopeResumesAll,
+		ScopeResumesRead,
+		ScopeResumesWrite,
+		ScopeResumesDelete,
+		ScopeResumesPublish,
+		ScopeResumesOwn,
+		ScopeResumesSearch,
+		ScopeResumesExport,
+	},
 }
 
 // DomainScopeDescriptions provides descriptions for domain scopes
@@ -134,17 +153,28 @@ var DomainScopeDescriptions = map[string]string{
 	ScopeOffersDelete:  "Delete offers",
 	ScopeOffersApprove: "Approve offers",
 	ScopeOffersSend:    "Send offers to candidates",
+
+	ScopeResumesAll:     "Full access to resume management",
+	ScopeResumesRead:    "View resumes",
+	ScopeResumesWrite:   "Create and edit resumes",
+	ScopeResumesDelete:  "Delete resumes",
+	ScopeResumesPublish: "Publish and activate resumes",
+	ScopeResumesOwn:     "Manage own resumes only (candidate access)",
+	ScopeResumesSearch:  "Search resumes using semantic search",
+	ScopeResumesExport:  "Export resume data",
 }
 
 // DomainScopeGroups defines domain-specific role groupings
+// Update DomainScopeGroups
 var DomainScopeGroups = map[string][]string{
-	// Recruitment roles
+	// Existing roles updated
 	"recruiter": {
 		ScopeJobsRead,
 		ScopeJobsWrite,
 		ScopeCandidatesAll,
 		ScopeApplicationsAll,
 		ScopeInterviewsAll,
+		ScopeResumesAll, // Added
 		ScopeReportsView,
 	},
 	"senior_recruiter": {
@@ -152,6 +182,7 @@ var DomainScopeGroups = map[string][]string{
 		ScopeCandidatesAll,
 		ScopeApplicationsAll,
 		ScopeInterviewsAll,
+		ScopeResumesAll, // Added
 		ScopeOffersRead,
 		ScopeOffersWrite,
 		ScopeReportsAll,
@@ -164,6 +195,8 @@ var DomainScopeGroups = map[string][]string{
 		ScopeApplicationsApprove,
 		ScopeInterviewsRead,
 		ScopeInterviewsSchedule,
+		ScopeResumesRead,   // Added
+		ScopeResumesSearch, // Added
 		ScopeOffersRead,
 		ScopeOffersApprove,
 		ScopeReportsView,
@@ -175,72 +208,40 @@ var DomainScopeGroups = map[string][]string{
 		ScopeApplicationsReview,
 		ScopeInterviewsRead,
 		ScopeInterviewsConduct,
+		ScopeResumesRead, // Added
 	},
 
-	// Job management roles
-	"job_manager": {
-		ScopeJobsAll,
-		ScopeApplicationsRead,
-		ScopeApplicationsReview,
-		ScopeCandidatesRead,
-		ScopeReportsView,
-	},
-	"job_creator": {
-		ScopeJobsRead,
-		ScopeJobsWrite,
-		ScopeJobsPublish,
-		ScopeApplicationsRead,
-		ScopeCandidatesRead,
-	},
-	"job_viewer": {
-		ScopeJobsRead,
-		ScopeApplicationsRead,
-		ScopeCandidatesRead,
+	// NEW: Candidate role
+	"candidate": {
+		ScopeResumesOwn,        // Can only manage their own resumes
+		ScopeApplicationsWrite, // Can create applications
+		ScopeApplicationsRead,  // Can view their own applications
+		ScopeJobsRead,          // Can view published jobs
 	},
 
-	// Candidate management roles
-	"candidate_manager": {
-		ScopeCandidatesAll,
-		ScopeApplicationsRead,
-		ScopeApplicationsWrite,
-		ScopeJobsRead,
-	},
-	"candidate_viewer": {
+	// NEW: Resume-specific roles
+	"resume_manager": {
+		ScopeResumesAll,
 		ScopeCandidatesRead,
 		ScopeApplicationsRead,
 		ScopeJobsRead,
 	},
-
-	// Application management roles
-	"application_reviewer": {
-		ScopeApplicationsRead,
-		ScopeApplicationsReview,
-		ScopeApplicationsWrite,
-		ScopeCandidatesRead,
-		ScopeJobsRead,
-	},
-	"application_manager": {
-		ScopeApplicationsAll,
+	"resume_reviewer": {
+		ScopeResumesRead,
+		ScopeResumesSearch,
 		ScopeCandidatesRead,
 		ScopeJobsRead,
 	},
 
-	// HR roles
+	// HR roles updated
 	"hr_admin": {
 		ScopeJobsAll,
 		ScopeCandidatesAll,
 		ScopeApplicationsAll,
 		ScopeInterviewsAll,
 		ScopeOffersAll,
+		ScopeResumesAll,
 		ScopeUsersRead,
 		ScopeReportsAll,
-	},
-	"hr_coordinator": {
-		ScopeJobsRead,
-		ScopeCandidatesRead,
-		ScopeApplicationsRead,
-		ScopeInterviewsAll,
-		ScopeOffersRead,
-		ScopeReportsView,
 	},
 }
