@@ -16,7 +16,7 @@ import (
 
 type ResumeHandlers struct {
 	service    *resumesrv.Service
-	fileSystem fsx.FileSystem // Add file system for uploads
+	fileSystem fsx.FileSystem
 }
 
 func NewResumeHandlers(service *resumesrv.Service, fileSystem fsx.FileSystem) *ResumeHandlers {
@@ -30,14 +30,15 @@ func (h *ResumeHandlers) RegisterRoutes(app *fiber.App, authMiddleware *auth.Uni
 	resumes := app.Group("/api/v1/resumes", authMiddleware.Authenticate())
 
 	// Resume CRUD
-	resumes.Post("/parse", h.ParseResume)  // Parse and create from file (ASYNC)
-	resumes.Post("/", h.CreateResume)      // Create manually
-	resumes.Get("/:id", h.GetResume)       // Get by ID
-	resumes.Put("/:id", h.UpdateResume)    // Update
-	resumes.Delete("/:id", h.DeleteResume) // Delete
-	resumes.Get("/", h.ListResumes)        // List all for tenant
+	resumes.Post("/parse/bulk", h.ParseResumeBulk) // Bulk upload (NEW)
+	resumes.Post("/parse", h.ParseResume)          // Parse and create from file (ASYNC)
+	resumes.Post("/", h.CreateResume)              // Create manually
+	resumes.Get("/:id", h.GetResume)               // Get by ID
+	resumes.Put("/:id", h.UpdateResume)            // Update
+	resumes.Delete("/:id", h.DeleteResume)         // Delete
+	resumes.Get("/", h.ListResumes)                // List all for tenant
 
-	// Job Management (NEW)
+	// Job Management
 	resumes.Get("/jobs/stats", h.GetJobStats)         // Get job statistics
 	resumes.Get("/jobs/:job_id", h.GetJobStatus)      // Get job status
 	resumes.Get("/jobs", h.ListJobs)                  // List all jobs
@@ -61,6 +62,183 @@ func (h *ResumeHandlers) RegisterRoutes(app *fiber.App, authMiddleware *auth.Uni
 // ============================================================================
 // Resume CRUD Handlers
 // ============================================================================
+
+// ParseResumeBulk parses multiple resumes from uploaded files (async processing)
+// POST /api/v1/resumes/parse/bulk
+func (h *ResumeHandlers) ParseResumeBulk(c *fiber.Ctx) error {
+	authCtx, ok := auth.GetAuthContext(c)
+	if !ok {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "authentication required",
+		})
+	}
+
+	// Parse multipart form
+	form, err := c.MultipartForm()
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid multipart form",
+		})
+	}
+
+	files := form.File["files"] // Note: "files" is the field name
+	if len(files) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "at least one file is required",
+			"hint":  "use 'files' as the field name for file uploads",
+		})
+	}
+
+	// Limit number of files (e.g., max 10 at a time)
+	maxFiles := 10
+	if len(files) > maxFiles {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":      "too many files",
+			"max_files":  maxFiles,
+			"file_count": len(files),
+		})
+	}
+
+	// Validate total size
+	maxSize := int64(10 * 1024 * 1024) // 10MB per file
+	for _, file := range files {
+		if file.Size > maxSize {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error":     "file too large",
+				"file_name": file.Filename,
+				"max_size":  "10MB",
+				"size":      file.Size,
+			})
+		}
+	}
+
+	// Get form fields (apply to all files)
+	isActive := c.FormValue("is_active", "true") == "true"
+	isDefault := c.FormValue("is_default", "false") == "true"
+
+	now := time.Now()
+	var jobResponses []fiber.Map
+	var errors []fiber.Map
+	successCount := 0
+	failureCount := 0
+
+	// Process each file
+	for idx, file := range files {
+		// Determine file type
+		fileType := determineFileType(file.Filename, file.Header.Get("Content-Type"))
+		if fileType == "" {
+			errors = append(errors, fiber.Map{
+				"file_name":       file.Filename,
+				"error":           "unsupported file type",
+				"supported_types": []string{"pdf", "jpg", "jpeg", "png"},
+				"detected_type":   file.Header.Get("Content-Type"),
+			})
+			failureCount++
+			continue
+		}
+
+		// Open uploaded file
+		uploadedFile, err := file.Open()
+		if err != nil {
+			errors = append(errors, fiber.Map{
+				"file_name": file.Filename,
+				"error":     "failed to open file",
+			})
+			failureCount++
+			continue
+		}
+
+		// Generate unique file path
+		uniqueID := uuid.New().String()
+		extension := filepath.Ext(file.Filename)
+		if extension == "" {
+			extension = "." + fileType
+		}
+
+		filePath := h.fileSystem.Join(
+			"resumes",
+			authCtx.TenantID.String(),
+			fmt.Sprintf("%d", now.Year()),
+			fmt.Sprintf("%02d", now.Month()),
+			uniqueID+extension,
+		)
+
+		// Upload file to storage
+		if err := h.fileSystem.WriteFileStream(c.Context(), filePath, uploadedFile); err != nil {
+			uploadedFile.Close()
+			errors = append(errors, fiber.Map{
+				"file_name": file.Filename,
+				"error":     "failed to upload file to storage",
+				"details":   err.Error(),
+			})
+			failureCount++
+			continue
+		}
+		uploadedFile.Close()
+
+		// Use filename as title (remove extension)
+		title := file.Filename
+		if ext := filepath.Ext(title); ext != "" {
+			title = title[:len(title)-len(ext)]
+		}
+
+		// Create parse request
+		req := resume.ParseResumeRequest{
+			TenantID:  authCtx.TenantID,
+			FilePath:  filePath,
+			FileName:  file.Filename,
+			FileType:  fileType,
+			Title:     title,
+			IsActive:  isActive,
+			IsDefault: isDefault && idx == 0, // Only first can be default
+		}
+
+		// Queue for async processing
+		jobResponse, err := h.service.ParseResumeAsync(c.Context(), req)
+		if err != nil {
+			// Clean up uploaded file
+			_ = h.fileSystem.DeleteFile(c.Context(), filePath)
+			errors = append(errors, fiber.Map{
+				"file_name": file.Filename,
+				"error":     "failed to queue job",
+				"details":   err.Error(),
+			})
+			failureCount++
+			continue
+		}
+
+		jobResponses = append(jobResponses, fiber.Map{
+			"file_name":  file.Filename,
+			"job_id":     jobResponse.JobID,
+			"status":     jobResponse.Status,
+			"status_url": fmt.Sprintf("/api/v1/resumes/jobs/%s", jobResponse.JobID),
+		})
+		successCount++
+	}
+
+	// Return summary
+	response := fiber.Map{
+		"message":       fmt.Sprintf("Processed %d files", len(files)),
+		"total_files":   len(files),
+		"success_count": successCount,
+		"failure_count": failureCount,
+		"jobs":          jobResponses,
+	}
+
+	if len(errors) > 0 {
+		response["errors"] = errors
+	}
+
+	// Determine status code
+	statusCode := fiber.StatusAccepted
+	if successCount == 0 {
+		statusCode = fiber.StatusBadRequest
+	} else if failureCount > 0 {
+		statusCode = fiber.StatusMultiStatus // 207
+	}
+
+	return c.Status(statusCode).JSON(response)
+}
 
 // ParseResume parses a resume from an uploaded file (async processing)
 // POST /api/v1/resumes/parse
@@ -344,7 +522,7 @@ func (h *ResumeHandlers) ListResumes(c *fiber.Ctx) error {
 }
 
 // ============================================================================
-// Job Management Handlers (NEW)
+// Job Management Handlers
 // ============================================================================
 
 // GetJobStatus retrieves the status of a resume processing job
