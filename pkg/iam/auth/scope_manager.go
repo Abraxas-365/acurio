@@ -1,5 +1,9 @@
 package auth
 
+import "slices"
+
+import "maps"
+
 import "strings"
 
 // ScopeCategories combines common and domain-specific categories
@@ -14,30 +18,18 @@ var ScopeGroups map[string][]string
 func init() {
 	// Merge categories
 	ScopeCategories = make(map[string][]string)
-	for k, v := range CommonScopeCategories {
-		ScopeCategories[k] = v
-	}
-	for k, v := range DomainScopeCategories {
-		ScopeCategories[k] = v
-	}
+	maps.Copy(ScopeCategories, CommonScopeCategories)
+	maps.Copy(ScopeCategories, DomainScopeCategories)
 
 	// Merge descriptions
 	ScopeDescriptions = make(map[string]string)
-	for k, v := range CommonScopeDescriptions {
-		ScopeDescriptions[k] = v
-	}
-	for k, v := range DomainScopeDescriptions {
-		ScopeDescriptions[k] = v
-	}
+	maps.Copy(ScopeDescriptions, CommonScopeDescriptions)
+	maps.Copy(ScopeDescriptions, DomainScopeDescriptions)
 
 	// Merge groups
 	ScopeGroups = make(map[string][]string)
-	for k, v := range CommonScopeGroups {
-		ScopeGroups[k] = v
-	}
-	for k, v := range DomainScopeGroups {
-		ScopeGroups[k] = v
-	}
+	maps.Copy(ScopeGroups, CommonScopeGroups)
+	maps.Copy(ScopeGroups, DomainScopeGroups)
 }
 
 // GetScopesByGroup returns all scopes for a given group
@@ -90,10 +82,8 @@ func ValidateScope(scope string) bool {
 	}
 
 	for _, scopes := range ScopeCategories {
-		for _, s := range scopes {
-			if s == scope {
-				return true
-			}
+		if slices.Contains(scopes, scope) {
+			return true
 		}
 	}
 	return false
@@ -102,10 +92,8 @@ func ValidateScope(scope string) bool {
 // IsCommonScope checks if a scope is a common/reusable scope
 func IsCommonScope(scope string) bool {
 	for _, scopes := range CommonScopeCategories {
-		for _, s := range scopes {
-			if s == scope {
-				return true
-			}
+		if slices.Contains(scopes, scope) {
+			return true
 		}
 	}
 	return false
@@ -114,10 +102,8 @@ func IsCommonScope(scope string) bool {
 // IsDomainScope checks if a scope is a domain-specific scope
 func IsDomainScope(scope string) bool {
 	for _, scopes := range DomainScopeCategories {
-		for _, s := range scopes {
-			if s == scope {
-				return true
-			}
+		if slices.Contains(scopes, scope) {
+			return true
 		}
 	}
 	return false
@@ -126,10 +112,8 @@ func IsDomainScope(scope string) bool {
 // GetScopeCategory returns the category of a scope
 func GetScopeCategory(scope string) string {
 	for category, scopes := range ScopeCategories {
-		for _, s := range scopes {
-			if s == scope {
-				return category
-			}
+		if slices.Contains(scopes, scope) {
+			return category
 		}
 	}
 	return "Unknown"

@@ -16,16 +16,6 @@ type UserRepository interface {
 	ExistsByEmail(ctx context.Context, email string, tenantID kernel.TenantID) (bool, error)
 }
 
-// UserRoleRepository define el contrato para la relación usuario-rol
-type UserRoleRepository interface {
-	FindRolesByUser(ctx context.Context, userID kernel.UserID) ([]kernel.RoleID, error)
-	AssignUserToRole(ctx context.Context, userID kernel.UserID, roleID kernel.RoleID) error
-	RemoveUserFromRole(ctx context.Context, userID kernel.UserID, roleID kernel.RoleID) error
-	RemoveAllUserRoles(ctx context.Context, userID kernel.UserID) error
-	FindUsersByRole(ctx context.Context, roleID kernel.RoleID) ([]kernel.UserID, error)
-	CountUsersByRole(ctx context.Context, roleID kernel.RoleID) (int, error)
-}
-
 // PasswordService define el contrato para el manejo de contraseñas
 type PasswordService interface {
 	HashPassword(password string) (string, error)

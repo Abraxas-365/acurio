@@ -22,8 +22,6 @@ import (
 	"github.com/Abraxas-365/relay/pkg/iam/invitation/invitationsrv"
 	"github.com/Abraxas-365/relay/pkg/iam/otp/otpinfra"
 	"github.com/Abraxas-365/relay/pkg/iam/otp/otpsrv"
-	"github.com/Abraxas-365/relay/pkg/iam/role/roleinfra"
-	"github.com/Abraxas-365/relay/pkg/iam/role/rolesrv"
 	"github.com/Abraxas-365/relay/pkg/iam/tenant/tenantinfra"
 	"github.com/Abraxas-365/relay/pkg/iam/tenant/tenantsrv"
 	"github.com/Abraxas-365/relay/pkg/iam/user/userinfra"
@@ -61,7 +59,6 @@ type Container struct {
 	APIKeyService     *apikeysrv.APIKeyService
 	TenantService     *tenantsrv.TenantService
 	UserService       *usersrv.UserService
-	RoleService       *rolesrv.RoleService
 	InvitationService *invitationsrv.InvitationService
 	OTPService        *otpsrv.OTPService
 
@@ -198,9 +195,6 @@ func (c *Container) initRepositories() {
 	tenantRepo := tenantinfra.NewPostgresTenantRepository(c.DB)
 	tenantConfigRepo := tenantinfra.NewPostgresTenantConfigRepository(c.DB)
 	userRepo := userinfra.NewPostgresUserRepository(c.DB)
-	userRoleRepo := userinfra.NewPostgresUserRoleRepository(c.DB)
-	roleRepo := roleinfra.NewPostgresRoleRepository(c.DB)
-	rolePermRepo := roleinfra.NewPostgresRolePermissionRepository(c.DB)
 	tokenRepo := authinfra.NewPostgresTokenRepository(c.DB)
 	sessionRepo := authinfra.NewPostgresSessionRepository(c.DB)
 	invitationRepo := invitationinfra.NewPostgresInvitationRepository(c.DB)
@@ -229,9 +223,8 @@ func (c *Container) initRepositories() {
 
 	// --- IAM Domain Services ---
 	c.TenantService = tenantsrv.NewTenantService(tenantRepo, tenantConfigRepo, userRepo)
-	c.UserService = usersrv.NewUserService(userRepo, userRoleRepo, tenantRepo, roleRepo, passwordSvc)
-	c.RoleService = rolesrv.NewRoleService(roleRepo, rolePermRepo, tenantRepo)
-	c.InvitationService = invitationsrv.NewInvitationService(invitationRepo, userRepo, tenantRepo, roleRepo)
+	c.UserService = usersrv.NewUserService(userRepo, tenantRepo, passwordSvc)
+	c.InvitationService = invitationsrv.NewInvitationService(invitationRepo, userRepo, tenantRepo)
 	c.APIKeyService = apikeysrv.NewAPIKeyService(apiKeyRepo, tenantRepo, userRepo)
 	c.OTPService = otpsrv.NewOTPService(otpRepo, NewConsoleNotifier())
 
@@ -390,7 +383,7 @@ func (n *ConsoleNotifier) SendOTP(ctx context.Context, contact string, code stri
 
 func repeatString(s string, count int) string {
 	result := ""
-	for i := 0; i < count; i++ {
+	for range count {
 		result += s
 	}
 	return result

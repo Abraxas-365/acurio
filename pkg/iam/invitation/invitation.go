@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/Abraxas-365/relay/pkg/errx"
-	"github.com/Abraxas-365/relay/pkg/iam/role"
 	"github.com/Abraxas-365/relay/pkg/kernel"
+	"slices"
 )
 
 // ============================================================================
@@ -31,7 +31,7 @@ type Invitation struct {
 	TenantID   kernel.TenantID  `db:"tenant_id" json:"tenant_id"`
 	Email      string           `db:"email" json:"email"`
 	Token      string           `db:"token" json:"token"`
-	RoleID     *kernel.RoleID   `db:"role_id" json:"role_id,omitempty"`
+	Scopes     []string         `db:"scopes" json:"scopes"` // ✅ Changed from RoleID
 	Status     InvitationStatus `db:"status" json:"status"`
 	InvitedBy  kernel.UserID    `db:"invited_by" json:"invited_by"`
 	ExpiresAt  time.Time        `db:"expires_at" json:"expires_at"`
@@ -46,7 +46,7 @@ type Invitation struct {
 // ============================================================================
 
 // ============================================================================
-// Getter Methods (para interfaces)
+// Getter Methods (para interfaces compatibles con auth)
 // ============================================================================
 
 // GetID retorna el ID de la invitación
@@ -64,9 +64,15 @@ func (i *Invitation) GetEmail() string {
 	return i.Email
 }
 
-// GetRoleID retorna el RoleID de la invitación
+// GetRoleID mantiene compatibilidad con auth (siempre retorna nil ahora)
+// Deprecated: Use GetScopes() instead
 func (i *Invitation) GetRoleID() *kernel.RoleID {
-	return i.RoleID
+	return nil
+}
+
+// GetScopes retorna los scopes de la invitación
+func (i *Invitation) GetScopes() []string {
+	return i.Scopes
 }
 
 // IsValid verifica si la invitación es válida
@@ -124,6 +130,21 @@ func (i *Invitation) MarkAsExpired() {
 	}
 }
 
+// HasScope verifica si la invitación incluye un scope específico
+func (i *Invitation) HasScope(scope string) bool {
+	for _, s := range i.Scopes {
+		if s == scope || s == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// HasAnyScope verifica si la invitación incluye alguno de los scopes
+func (i *Invitation) HasAnyScope(scopes ...string) bool {
+	return slices.ContainsFunc(scopes, i.HasScope)
+}
+
 // ============================================================================
 // DTOs
 // ============================================================================
@@ -134,7 +155,7 @@ type InvitationDetailsDTO struct {
 	TenantID   kernel.TenantID  `json:"tenant_id"`
 	Email      string           `json:"email"`
 	Status     InvitationStatus `json:"status"`
-	RoleID     *kernel.RoleID   `json:"role_id,omitempty"`
+	Scopes     []string         `json:"scopes"`
 	ExpiresAt  time.Time        `json:"expires_at"`
 	AcceptedAt *time.Time       `json:"accepted_at,omitempty"`
 	CreatedAt  time.Time        `json:"created_at"`
@@ -147,7 +168,7 @@ func (i *Invitation) ToDTO() InvitationDetailsDTO {
 		TenantID:   i.TenantID,
 		Email:      i.Email,
 		Status:     i.Status,
-		RoleID:     i.RoleID,
+		Scopes:     i.Scopes,
 		ExpiresAt:  i.ExpiresAt,
 		AcceptedAt: i.AcceptedAt,
 		CreatedAt:  i.CreatedAt,
@@ -160,9 +181,10 @@ func (i *Invitation) ToDTO() InvitationDetailsDTO {
 
 // CreateInvitationRequest representa la petición para crear una invitación
 type CreateInvitationRequest struct {
-	Email     string         `json:"email" validate:"required,email"`
-	RoleID    *kernel.RoleID `json:"role_id,omitempty"`
-	ExpiresIn *int           `json:"expires_in,omitempty"` // Días hasta expiración (default: 7)
+	Email         string   `json:"email" validate:"required,email"`
+	Scopes        []string `json:"scopes,omitempty"`         // ✅ Direct scopes
+	ScopeTemplate *string  `json:"scope_template,omitempty"` // ✅ Optional: "recruiter", "hiring_manager", etc
+	ExpiresIn     *int     `json:"expires_in,omitempty"`     // Días hasta expiración (default: 7)
 }
 
 // AcceptInvitationRequest representa la petición para aceptar una invitación
@@ -172,26 +194,22 @@ type AcceptInvitationRequest struct {
 
 // InvitationResponse representa la respuesta con información de invitación
 type InvitationResponse struct {
-	Invitation Invitation `json:"invitation"`
-	Role       *role.Role `json:"role,omitempty"`
+	Invitation     Invitation `json:"invitation"`
+	ScopeTemplates []string   `json:"scope_templates,omitempty"` // ✅ Available templates
 }
 
 // ToDTO convierte InvitationResponse a InvitationResponseDTO
 func (ir *InvitationResponse) ToDTO() InvitationResponseDTO {
-	dto := InvitationResponseDTO{
-		Invitation: ir.Invitation.ToDTO(),
+	return InvitationResponseDTO{
+		Invitation:     ir.Invitation.ToDTO(),
+		ScopeTemplates: ir.ScopeTemplates,
 	}
-	if ir.Role != nil {
-		roleDTO := ir.Role.ToDTO()
-		dto.Role = &roleDTO
-	}
-	return dto
 }
 
 // InvitationResponseDTO es la versión DTO de InvitationResponse
 type InvitationResponseDTO struct {
-	Invitation InvitationDetailsDTO `json:"invitation"`
-	Role       *role.RoleDetailsDTO `json:"role,omitempty"`
+	Invitation     InvitationDetailsDTO `json:"invitation"`
+	ScopeTemplates []string             `json:"scope_templates,omitempty"`
 }
 
 // InvitationListResponse para listas de invitaciones
@@ -272,6 +290,8 @@ var (
 	CodeInvitationAlreadyRevoked  = ErrRegistry.Register("ALREADY_REVOKED", errx.TypeBusiness, http.StatusConflict, "Invitación ya revocada")
 	CodeInvitationAlreadyExists   = ErrRegistry.Register("ALREADY_EXISTS", errx.TypeConflict, http.StatusConflict, "Ya existe una invitación pendiente para este email")
 	CodeUserAlreadyExists         = ErrRegistry.Register("USER_ALREADY_EXISTS", errx.TypeConflict, http.StatusConflict, "El usuario ya existe en este tenant")
+	CodeInvalidScopeTemplate      = ErrRegistry.Register("INVALID_SCOPE_TEMPLATE", errx.TypeValidation, http.StatusBadRequest, "Plantilla de scopes no encontrada")
+	CodeInvalidScopes             = ErrRegistry.Register("INVALID_SCOPES", errx.TypeValidation, http.StatusBadRequest, "Scopes inválidos")
 )
 
 // Helper functions para crear errores
@@ -301,4 +321,12 @@ func ErrInvitationAlreadyExists() *errx.Error {
 
 func ErrUserAlreadyExists() *errx.Error {
 	return ErrRegistry.New(CodeUserAlreadyExists)
+}
+
+func ErrInvalidScopeTemplate() *errx.Error {
+	return ErrRegistry.New(CodeInvalidScopeTemplate)
+}
+
+func ErrInvalidScopes() *errx.Error {
+	return ErrRegistry.New(CodeInvalidScopes)
 }

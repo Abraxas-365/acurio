@@ -1,0 +1,53 @@
+version: '3.9'
+
+services:
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: relay-postgres
+    restart: unless-stopped
+    ports:
+      - "5438:5432"  # Non-standard port to avoid conflicts
+    environment:
+      POSTGRES_USER: relay_user
+      POSTGRES_PASSWORD: relay_pass_dev_2024
+      POSTGRES_DB: relay_dev
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay_user -d relay_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - relay-network
+
+  # Redis for job queues and caching
+  redis:
+    image: redis:7-alpine
+    container_name: relay-redis
+    restart: unless-stopped
+    ports:
+      - "6381:6379"  # Non-standard port to avoid conflicts
+    command: redis-server --appendonly yes --requirepass ""
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - relay-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  relay-network:
+    driver: bridge

@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/Abraxas-365/relay/pkg/errx"
-	"github.com/Abraxas-365/relay/pkg/iam/role"
+	"github.com/Abraxas-365/relay/pkg/iam/auth"
 	"github.com/Abraxas-365/relay/pkg/iam/tenant"
 	"github.com/Abraxas-365/relay/pkg/iam/user"
 	"github.com/Abraxas-365/relay/pkg/kernel"
@@ -14,27 +14,21 @@ import (
 
 // UserService proporciona operaciones de negocio para usuarios
 type UserService struct {
-	userRepo     user.UserRepository
-	userRoleRepo user.UserRoleRepository
-	tenantRepo   tenant.TenantRepository
-	roleRepo     role.RoleRepository
-	passwordSvc  user.PasswordService
+	userRepo    user.UserRepository
+	tenantRepo  tenant.TenantRepository
+	passwordSvc user.PasswordService
 }
 
 // NewUserService crea una nueva instancia del servicio de usuarios
 func NewUserService(
 	userRepo user.UserRepository,
-	userRoleRepo user.UserRoleRepository,
 	tenantRepo tenant.TenantRepository,
-	roleRepo role.RoleRepository,
 	passwordSvc user.PasswordService,
 ) *UserService {
 	return &UserService{
-		userRepo:     userRepo,
-		userRoleRepo: userRoleRepo,
-		tenantRepo:   tenantRepo,
-		roleRepo:     roleRepo,
-		passwordSvc:  passwordSvc,
+		userRepo:    userRepo,
+		tenantRepo:  tenantRepo,
+		passwordSvc: passwordSvc,
 	}
 }
 
@@ -64,18 +58,15 @@ func (s *UserService) CreateUser(ctx context.Context, req user.CreateUserRequest
 		return nil, user.ErrUserAlreadyExists()
 	}
 
-	// Determinar scopes por defecto si no se proporcionaron
-	scopes := req.Scopes
-	if len(scopes) == 0 {
-		// Default scopes for new users
-		scopes = []string{
-			"channels:read",
-			"channels:write",
-			"messages:read",
-			"messages:send",
-			"tools:read",
-			"workflows:read",
-		}
+	// Determinar scopes
+	scopes, err := s.resolveScopes(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validar scopes
+	if err := s.validateScopes(scopes); err != nil {
+		return nil, err
 	}
 
 	// Crear nuevo usuario
@@ -96,14 +87,6 @@ func (s *UserService) CreateUser(ctx context.Context, req user.CreateUserRequest
 		return nil, errx.Wrap(err, "failed to save user", errx.TypeInternal)
 	}
 
-	// Asignar roles si se especificaron
-	if len(req.RoleIDs) > 0 {
-		if err := s.assignRolesToUser(ctx, newUser.ID, req.RoleIDs); err != nil {
-			// Log error pero no fallar
-			// logger.Error("Failed to assign roles to user", err)
-		}
-	}
-
 	// Incrementar contador de usuarios del tenant
 	if err := tenantEntity.AddUser(); err == nil {
 		s.tenantRepo.Save(ctx, *tenantEntity)
@@ -119,15 +102,8 @@ func (s *UserService) GetUserByID(ctx context.Context, userID kernel.UserID, ten
 		return nil, user.ErrUserNotFound()
 	}
 
-	// Obtener roles del usuario
-	roleIDs, err := s.userRoleRepo.FindRolesByUser(ctx, userID)
-	if err != nil {
-		roleIDs = []kernel.RoleID{} // Default a empty slice
-	}
-
 	return &user.UserResponse{
-		User:    *userEntity,
-		RoleIDs: roleIDs,
+		User: *userEntity,
 	}, nil
 }
 
@@ -138,15 +114,8 @@ func (s *UserService) GetUserByEmail(ctx context.Context, email string, tenantID
 		return nil, user.ErrUserNotFound()
 	}
 
-	// Obtener roles del usuario
-	roleIDs, err := s.userRoleRepo.FindRolesByUser(ctx, userEntity.ID)
-	if err != nil {
-		roleIDs = []kernel.RoleID{}
-	}
-
 	return &user.UserResponse{
-		User:    *userEntity,
-		RoleIDs: roleIDs,
+		User: *userEntity,
 	}, nil
 }
 
@@ -159,10 +128,8 @@ func (s *UserService) GetUsersByTenant(ctx context.Context, tenantID kernel.Tena
 
 	var userResponses []user.UserResponse
 	for _, u := range users {
-		roleIDs, _ := s.userRoleRepo.FindRolesByUser(ctx, u.ID)
 		userResponses = append(userResponses, user.UserResponse{
-			User:    *u,
-			RoleIDs: roleIDs,
+			User: *u,
 		})
 	}
 
@@ -183,6 +150,7 @@ func (s *UserService) UpdateUser(ctx context.Context, userID kernel.UserID, req 
 	if req.Name != nil {
 		userEntity.Name = *req.Name
 	}
+
 	if req.Status != nil {
 		switch *req.Status {
 		case user.UserStatusActive:
@@ -195,8 +163,24 @@ func (s *UserService) UpdateUser(ctx context.Context, userID kernel.UserID, req 
 			}
 		}
 	}
+
+	// Actualizar scopes si se proporcionaron
 	if req.Scopes != nil && len(req.Scopes) > 0 {
+		if err := s.validateScopes(req.Scopes); err != nil {
+			return nil, err
+		}
 		userEntity.SetScopes(req.Scopes)
+	}
+
+	// Aplicar scope template si se proporciona
+	if req.ScopeTemplate != nil && *req.ScopeTemplate != "" {
+		scopes := auth.GetScopesByGroup(*req.ScopeTemplate)
+		if len(scopes) == 0 {
+			return nil, user.ErrInvalidScopeTemplate().
+				WithDetail("template", *req.ScopeTemplate).
+				WithDetail("available_templates", s.GetAvailableScopeTemplates())
+		}
+		userEntity.SetScopes(scopes)
 	}
 
 	userEntity.UpdatedAt = time.Now()
@@ -237,70 +221,12 @@ func (s *UserService) SuspendUser(ctx context.Context, userID kernel.UserID, ten
 	return s.userRepo.Save(ctx, *userEntity)
 }
 
-// AssignUserToRole asigna un usuario a un rol
-func (s *UserService) AssignUserToRole(ctx context.Context, userID kernel.UserID, roleID kernel.RoleID, tenantID kernel.TenantID) error {
-	// Verificar que el usuario existe
-	_, err := s.userRepo.FindByID(ctx, userID, tenantID)
-	if err != nil {
-		return user.ErrUserNotFound()
-	}
-
-	// Verificar que el rol existe y pertenece al mismo tenant
-	_, err = s.roleRepo.FindByID(ctx, roleID, tenantID)
-	if err != nil {
-		return role.ErrRoleNotFound()
-	}
-
-	return s.userRoleRepo.AssignUserToRole(ctx, userID, roleID)
-}
-
-// RemoveUserFromRole remueve un usuario de un rol
-func (s *UserService) RemoveUserFromRole(ctx context.Context, userID kernel.UserID, roleID kernel.RoleID, tenantID kernel.TenantID) error {
-	// Verificar que el usuario existe
-	_, err := s.userRepo.FindByID(ctx, userID, tenantID)
-	if err != nil {
-		return user.ErrUserNotFound()
-	}
-
-	return s.userRoleRepo.RemoveUserFromRole(ctx, userID, roleID)
-}
-
-// GetUserRoles obtiene los roles de un usuario
-func (s *UserService) GetUserRoles(ctx context.Context, userID kernel.UserID, tenantID kernel.TenantID) ([]*role.Role, error) {
-	// Verificar que el usuario existe
-	_, err := s.userRepo.FindByID(ctx, userID, tenantID)
-	if err != nil {
-		return nil, user.ErrUserNotFound()
-	}
-
-	roleIDs, err := s.userRoleRepo.FindRolesByUser(ctx, userID)
-	if err != nil {
-		return nil, errx.Wrap(err, "failed to get user roles", errx.TypeInternal)
-	}
-
-	var roles []*role.Role
-	for _, roleID := range roleIDs {
-		roleEntity, err := s.roleRepo.FindByID(ctx, roleID, tenantID)
-		if err != nil {
-			continue // Skip invalid roles
-		}
-		roles = append(roles, roleEntity)
-	}
-
-	return roles, nil
-}
-
 // DeleteUser elimina un usuario
 func (s *UserService) DeleteUser(ctx context.Context, userID kernel.UserID, tenantID kernel.TenantID) error {
 	// Verificar que el usuario existe
 	_, err := s.userRepo.FindByID(ctx, userID, tenantID)
 	if err != nil {
 		return user.ErrUserNotFound()
-	}
-
-	// Remover todos los roles del usuario
-	if err := s.userRoleRepo.RemoveAllUserRoles(ctx, userID); err != nil {
-		// Log error pero continúar
 	}
 
 	// Eliminar usuario
@@ -318,12 +244,242 @@ func (s *UserService) DeleteUser(ctx context.Context, userID kernel.UserID, tena
 	return nil
 }
 
-// Helper function to assign multiple roles to user
-func (s *UserService) assignRolesToUser(ctx context.Context, userID kernel.UserID, roleIDs []kernel.RoleID) error {
-	for _, roleID := range roleIDs {
-		if err := s.userRoleRepo.AssignUserToRole(ctx, userID, roleID); err != nil {
-			return err
+// ============================================================================
+// Scope Management Methods
+// ============================================================================
+
+// AddScopesToUser agrega scopes a un usuario
+func (s *UserService) AddScopesToUser(ctx context.Context, userID kernel.UserID, tenantID kernel.TenantID, scopes []string) error {
+	userEntity, err := s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return user.ErrUserNotFound()
+	}
+
+	// Validar scopes
+	if err := s.validateScopes(scopes); err != nil {
+		return err
+	}
+
+	// Agregar scopes (evitando duplicados)
+	for _, scope := range scopes {
+		if !userEntity.HasScope(scope) {
+			userEntity.AddScope(scope)
 		}
 	}
+
+	return s.userRepo.Save(ctx, *userEntity)
+}
+
+// RemoveScopesFromUser remueve scopes de un usuario
+func (s *UserService) RemoveScopesFromUser(ctx context.Context, userID kernel.UserID, tenantID kernel.TenantID, scopes []string) error {
+	userEntity, err := s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return user.ErrUserNotFound()
+	}
+
+	// Remover scopes
+	for _, scope := range scopes {
+		userEntity.RemoveScope(scope)
+	}
+
+	return s.userRepo.Save(ctx, *userEntity)
+}
+
+// SetUserScopes establece los scopes de un usuario (reemplaza los existentes)
+func (s *UserService) SetUserScopes(ctx context.Context, userID kernel.UserID, tenantID kernel.TenantID, scopes []string) error {
+	userEntity, err := s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return user.ErrUserNotFound()
+	}
+
+	// Validar scopes
+	if err := s.validateScopes(scopes); err != nil {
+		return err
+	}
+
+	userEntity.SetScopes(scopes)
+	return s.userRepo.Save(ctx, *userEntity)
+}
+
+// ApplyScopeTemplateToUser aplica una plantilla de scopes a un usuario
+func (s *UserService) ApplyScopeTemplateToUser(ctx context.Context, userID kernel.UserID, tenantID kernel.TenantID, templateName string) error {
+	userEntity, err := s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return user.ErrUserNotFound()
+	}
+
+	scopes := auth.GetScopesByGroup(templateName)
+	if len(scopes) == 0 {
+		return user.ErrInvalidScopeTemplate().
+			WithDetail("template", templateName).
+			WithDetail("available_templates", s.GetAvailableScopeTemplates())
+	}
+
+	userEntity.SetScopes(scopes)
+	return s.userRepo.Save(ctx, *userEntity)
+}
+
+// GetUserScopes obtiene los scopes de un usuario
+func (s *UserService) GetUserScopes(ctx context.Context, userID kernel.UserID, tenantID kernel.TenantID) (*user.UserScopesResponse, error) {
+	userEntity, err := s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return nil, user.ErrUserNotFound()
+	}
+
+	// Construir información detallada de scopes
+	scopeDetails := make([]user.ScopeDetail, 0, len(userEntity.Scopes))
+	for _, scope := range userEntity.Scopes {
+		scopeDetails = append(scopeDetails, user.ScopeDetail{
+			Name:        scope,
+			Description: auth.GetScopeDescription(scope),
+			Category:    auth.GetScopeCategory(scope),
+		})
+	}
+
+	return &user.UserScopesResponse{
+		UserID:       userID,
+		Scopes:       userEntity.Scopes,
+		ScopeDetails: scopeDetails,
+		TotalScopes:  len(userEntity.Scopes),
+		IsAdmin:      userEntity.IsAdmin(),
+	}, nil
+}
+
+// MakeUserAdmin convierte a un usuario en administrador
+func (s *UserService) MakeUserAdmin(ctx context.Context, userID kernel.UserID, tenantID kernel.TenantID) error {
+	userEntity, err := s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return user.ErrUserNotFound()
+	}
+
+	userEntity.MakeAdmin()
+	return s.userRepo.Save(ctx, *userEntity)
+}
+
+// RevokeUserAdmin revoca permisos de administrador
+func (s *UserService) RevokeUserAdmin(ctx context.Context, userID kernel.UserID, tenantID kernel.TenantID) error {
+	userEntity, err := s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return user.ErrUserNotFound()
+	}
+
+	userEntity.RevokeAdmin()
+	return s.userRepo.Save(ctx, *userEntity)
+}
+
+// GetAvailableScopeTemplates retorna las plantillas de scopes disponibles
+func (s *UserService) GetAvailableScopeTemplates() []string {
+	templates := make([]string, 0, len(auth.ScopeGroups))
+	for template := range auth.ScopeGroups {
+		templates = append(templates, template)
+	}
+	return templates
+}
+
+// GetScopeTemplateDetails obtiene los detalles de una plantilla
+func (s *UserService) GetScopeTemplateDetails(templateName string) (*user.ScopeTemplateResponse, error) {
+	scopes := auth.GetScopesByGroup(templateName)
+	if len(scopes) == 0 {
+		return nil, user.ErrInvalidScopeTemplate().WithDetail("template", templateName)
+	}
+
+	scopeDetails := make([]user.ScopeDetail, 0, len(scopes))
+	for _, scope := range scopes {
+		scopeDetails = append(scopeDetails, user.ScopeDetail{
+			Name:        scope,
+			Description: auth.GetScopeDescription(scope),
+			Category:    auth.GetScopeCategory(scope),
+		})
+	}
+
+	return &user.ScopeTemplateResponse{
+		TemplateName: templateName,
+		Scopes:       scopes,
+		ScopeDetails: scopeDetails,
+		TotalScopes:  len(scopes),
+	}, nil
+}
+
+// GetAllAvailableScopes retorna todos los scopes disponibles del sistema
+func (s *UserService) GetAllAvailableScopes() *user.AvailableScopesResponse {
+	allScopes := auth.GetAllScopes()
+	categories := make(map[string][]user.ScopeDetail)
+
+	// Agrupar por categoría
+	for _, scope := range allScopes {
+		category := auth.GetScopeCategory(scope)
+		scopeDetail := user.ScopeDetail{
+			Name:        scope,
+			Description: auth.GetScopeDescription(scope),
+			Category:    category,
+		}
+		categories[category] = append(categories[category], scopeDetail)
+	}
+
+	return &user.AvailableScopesResponse{
+		TotalScopes: len(allScopes),
+		Categories:  categories,
+		Templates:   s.GetAvailableScopeTemplates(),
+	}
+}
+
+// ============================================================================
+// Private Helper Methods
+// ============================================================================
+
+// resolveScopes determina los scopes finales basándose en la request
+func (s *UserService) resolveScopes(req user.CreateUserRequest) ([]string, error) {
+	// Si se proporcionan scopes directamente, usarlos
+	if len(req.Scopes) > 0 {
+		return req.Scopes, nil
+	}
+
+	// Si se proporciona un template, expandirlo
+	if req.ScopeTemplate != nil && *req.ScopeTemplate != "" {
+		scopes := auth.GetScopesByGroup(*req.ScopeTemplate)
+		if len(scopes) == 0 {
+			return nil, user.ErrInvalidScopeTemplate().
+				WithDetail("template", *req.ScopeTemplate).
+				WithDetail("available_templates", s.GetAvailableScopeTemplates())
+		}
+		return scopes, nil
+	}
+
+	// Default: usar template "viewer" o scopes básicos
+	defaultScopes := auth.GetScopesByGroup("viewer")
+	if len(defaultScopes) == 0 {
+		// Fallback a scopes muy básicos
+		defaultScopes = []string{
+			auth.ScopeUsersRead,
+			auth.ScopeJobsRead,
+			auth.ScopeCandidatesRead,
+			auth.ScopeResumesRead,
+		}
+	}
+
+	return defaultScopes, nil
+}
+
+// validateScopes valida que los scopes sean válidos
+func (s *UserService) validateScopes(scopes []string) error {
+	if len(scopes) == 0 {
+		return user.ErrInvalidScopes().WithDetail("reason", "at least one scope is required")
+	}
+
+	// Validar cada scope
+	invalidScopes := []string{}
+	for _, scope := range scopes {
+		if !auth.ValidateScope(scope) {
+			invalidScopes = append(invalidScopes, scope)
+		}
+	}
+
+	if len(invalidScopes) > 0 {
+		return user.ErrInvalidScopes().
+			WithDetail("invalid_scopes", invalidScopes).
+			WithDetail("hint", "Use GetAllAvailableScopes() to see valid scopes")
+	}
+
 	return nil
 }
+

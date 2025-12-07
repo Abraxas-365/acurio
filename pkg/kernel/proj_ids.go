@@ -1,9 +1,5 @@
 package kernel
 
-func NewApplicationID(id string) ApplicationID { return ApplicationID(id) }
-func (r ApplicationID) String() string         { return string(r) }
-func (r ApplicationID) IsEmpty() bool          { return string(r) == "" }
-
 type CandidateID string
 
 func NewCandidateID(id string) CandidateID { return CandidateID(id) }
